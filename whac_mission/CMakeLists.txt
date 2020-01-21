@@ -15,9 +15,9 @@ find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   tf
   whac_gazebo
-  whac_drivers
   whac_motion
   whac_description
+  map_server
   )
 
 catkin_python_setup()
@@ -31,7 +31,7 @@ catkin_package(CATKIN_DEPENDS
   geometry_msgs
   tf
   whac_gazebo
-  whac_drivers
   whac_motion
   whac_description
+  map_server
   )

@@ -3,6 +3,7 @@ from std_msgs.msg import String, Bool, Header
 from nav_msgs.msg import Path
 from geometry_msgs.msg import Pose, PoseStamped, Quaternion, Point, PointStamped, Twist, TwistStamped, Vector3
 from sensor_msgs.msg import PointCloud2
+from nav_msgs.srv import GetPlan
 from collections import namedtuple
 import numpy as np
 from math import sin, cos
@@ -10,6 +11,7 @@ import tf2_ros as tf2
 import sensor_msgs.point_cloud2 as pc2
 import tf2_sensor_msgs.tf2_sensor_msgs as tf2sm
 import tf
+from whac_motion.srv import GotoGoal, GotoGoalResponse
 
 
 class SamplingPlanner:
@@ -43,12 +45,15 @@ class SamplingPlanner:
 
         self.tfb = tf2.Buffer()
         self.tfl = tf2.TransformListener(self.tfb)
+        self.tfr = tf.TransformerROS()
+
+        self.followPath = False
 
         self.x = [0, 0, 0]
         self.obstacles = [[1., 0.]]
-        self.waypoints = [[0., 0.], [2., 1.], [3., 4.], [2., 6.], [0., 6.]]
+        self.globalPath = Path()
         self.carrotIdx = 0
-        self.cx = self.waypoints[self.carrotIdx]
+        self.cx = None
 
         self.odom_frame = rospy.get_param('odom_frame', 'odom')
         self.base_frame = rospy.get_param('base_frame', 'base_link')
@@ -60,15 +65,17 @@ class SamplingPlanner:
         for i in range(self.params.numTrajectories):
             self.trajPubs.append(rospy.Publisher("traj_candidates/traj_{}".format(i), Path, queue_size=10))
 
-        self.localPlanPub = rospy.Publisher("local_plan", Path, queue_size=10)
-        self.globalPlanPub = rospy.Publisher("global_plan", Path, queue_size=10)
-        self.cmdVelPub = rospy.Publisher("cmd_vel", Twist, queue_size=10)
-        self.carrotPub = rospy.Publisher("carrot_pos", PointStamped, queue_size=10)
+        self.localPlanPub = rospy.Publisher("~local_plan", Path, queue_size=10)
+        self.globalPlanPub = rospy.Publisher("~global_plan", Path, queue_size=10)
+        self.cmdVelPub = rospy.Publisher("/cmd_vel", Twist, queue_size=10)
+        self.carrotPub = rospy.Publisher("~carrot_pos", PointStamped, queue_size=10)
 
         self.obstacleSub = rospy.Subscriber(self.cloudTopic, PointCloud2, self.updateObstacles)
 
+        rospy.wait_for_service(rospy.get_param('planner_service', '/astar_planner/get_plan'), )
+        self.globalPlannerSrv = rospy.ServiceProxy(rospy.get_param('planner_service', '/astar_planner/get_plan'), GetPlan)
+
         map(float, self.x)
-        map(float, self.cx)
 
     def computeTrajectories(self):
         trajectories = []
@@ -127,14 +134,30 @@ class SamplingPlanner:
         return res
 
     def moveCarrot(self):
-        while (self.x[0] - self.cx[0]) ** 2 + \
-                (self.x[1] - self.cx[1]) ** 2 < self.params.carrotDist ** 2:
+        xp = PointStamped()
+        xp.header.frame_id = self.odom_frame
+        xp.point= Point(self.x[0], self.x[1], 0)
+        try:
+            xgp = self.tfr.transformPoint(xp, "map")
+        except:
+            rospy.logwarn("Error transforming point!")
+            return
 
-            if self.carrotIdx >= len(self.waypoints) - 1:
+        xg = [xgp.point.x, xgp.point.y]
+
+        waypoints = self.path2traj(self.globalPath)
+
+        if self.cx is None:
+            self.cx = waypoints[0]
+
+        while (xg[0] - self.cx[0]) ** 2 + \
+                (xg[1] - self.cx[1]) ** 2 < self.params.carrotDist ** 2:
+
+            if self.carrotIdx >= len(waypoints) - 1:
                 break
 
-            pt0 = np.array(self.waypoints[self.carrotIdx])
-            pt1 = np.array(self.waypoints[self.carrotIdx + 1])
+            pt0 = np.array(waypoints[self.carrotIdx])
+            pt1 = np.array(waypoints[self.carrotIdx + 1])
             cpt = np.array(self.cx)
             v = pt1 - pt0
             v /= np.linalg.norm(v)
@@ -148,14 +171,28 @@ class SamplingPlanner:
 
     def getRewards(self, trajectories):
         rewards = []
+
+        cxp = PointStamped()
+        cxp.header.frame_id = self.odom_frame
+        cxp.point = Point(self.x[0], self.x[1], 0)
+        try:
+            cxop = self.tfr.transformPoint(cxp, "odom")
+        except:
+            rospy.logwarn("Error transforming point!")
+            return []
+
+        cxo = [cxop.point.x, cxop.point.y]
+
         for traj in trajectories:
             pt = np.array(traj[-1][0:2])
-            cpt = np.array(self.cx)
+            cpt = np.array(cxo)
             d2 = np.linalg.norm(pt - cpt)
             rewards.append(-d2)
         return rewards
 
     def update(self, timerEvent):
+        if not self.followPath:
+            return
 
         # Update Robot State:
         try:
@@ -163,6 +200,7 @@ class SamplingPlanner:
         except:
             rospy.logwarn("Error looking up transform!")
             return
+
         q = trans.transform.rotation
         rpy = tf.transformations.euler_from_quaternion((q.x, q.y, q.z, q.w))
         pos = trans.transform.translation
@@ -184,12 +222,26 @@ class SamplingPlanner:
 
         # Move the carrot (sliding goal) and calculate rewards
         self.moveCarrot()
+
+        if self.cx is None:
+            rospy.loginfo("Carrot does not yet exist! Is there a global plan?")
+            return
+
         rewards = self.getRewards(trajectories)
+
+        lowestDist = max(rewards)
         best = argmax(rewards)
+
+        if len(rewards) > 0 and abs(lowestDist) < self.satisfaction_threshold**2 \
+            and self.carrotIdx >= len(self.globalPath.poses):
+            self.followPath = False
+            self.cx = None
+            self.globalPath = Path()
+            rospy.loginfo("Satisfaction Achieved!")
 
         # Publish results
         self.localPlanPub.publish(traj2path(trajectories[best]))
-        self.globalPlanPub.publish(traj2path(self.waypoints))
+        self.globalPlanPub.publish(self.globalPath)
         self.carrotPub.publish(pt2point(self.cx))
         self.cmdVelPub.publish(input2twist(inputs[best]))
 
@@ -208,6 +260,60 @@ class SamplingPlanner:
 
         # Extract obstacle locations:
         self.obstacles = pc2.read_points_list(cloud, field_names=["x", "y"], skip_nans=True)
+
+    def path2traj(self, path):
+        pts = []
+        for ps in path.poses:
+            try:
+                ps = self.tfr.transformPose(ps, "map")
+            except:
+                rospy.logwarn("Error looking up transform!")
+            pts.append([ps.point.x, ps.point.y])
+        return pts
+
+    def getGlobalTraj(self, pos):
+        try:
+            pos = self.tfr.transformPose(pos, 'map')
+        except:
+            rospy.logwarn("Error looking up transform!")
+            return False
+
+
+        try:
+            trans = self.tfb.lookup_transform(self.odom_frame, self.base_frame, rospy.Time(0))
+        except:
+            rospy.logwarn("Error looking up transform!")
+            return
+
+        req = GetPlan()
+        h = Header()
+        h.stamp = rospy.Time.now()
+        req.start = PoseStamped()
+        req.end = PoseStamped()
+        req.start.header = h
+        req.start.pose.position = Point(trans.x, trans.y, 0)
+        req.end = pos
+        req.end.header = h
+        res = self.globalPlannerSrv()
+        if len(res.plan.poses) == 0:
+            rospy.logwarn("No valid global trajectory was found!")
+            return None
+        else:
+            return res.plan
+
+    def startPathing(self, gotoGoal):
+        globalPath = self.getGlobalTraj(gotoGoal.goal)
+
+        if globalPath is None:
+            self.followPath = False
+            self.cx = None
+            self.globalPath = Path()
+            return GotoGoalResponse(False)
+
+        self.followPath = True
+        self.globalPath = globalPath
+        return GotoGoalResponse(True)
+
 
     def start(self):
         rospy.Timer(rospy.Duration(1.0 / self.params.frequency), self.update)
@@ -242,7 +348,10 @@ def input2twist(input):
     twist.angular = Vector3(0, 0, input[1])
     return twist
 
+
 def pt2point(input):
+    if input is None:
+        return
     p = PointStamped()
     p.header = Header()
     p.header.stamp = rospy.Time.now()
@@ -252,6 +361,7 @@ def pt2point(input):
     p.point.y = input[1]
     p.point.z = 0
     return p
+
 
 def main():
     rospy.init_node('sampling_planner')
