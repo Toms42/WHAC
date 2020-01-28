@@ -1,0 +1,4 @@
+<launch>
+    <rosparam file="$(find whac_motion)/motion_params.yaml"/>
+    <node pkg="whac_motion" type="astar_planner" name="astar_planner" output="screen"/>
+</launch>

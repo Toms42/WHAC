@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>whac_mission</name>
+  <version>0.0.0</version>
+  <description>The mission package</description>
+
+  <maintainer email="tscherli@andrew.cmu.edu">Tom Scherlis</maintainer>
+  <author email="tscherli@andrew.cmu.edu">Tom Scherlis</author>
+
+  <license>MIT</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <depend>message_runtime</depend>
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf</depend>
+  <depend>whac_gazebo</depend>
+  <depend>whac_motion</depend>
+  <depend>whac_description</depend>
+  <depend>map_server</depend>
+
+
+  <!-- The export tag contains other, unspecified, tags -->
+  <export>
+    <!-- Other tools can request additional information be placed here -->
+
+  </export>
+</package>
